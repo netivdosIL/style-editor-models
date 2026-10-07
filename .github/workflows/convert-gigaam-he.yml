@@ -416,7 +416,7 @@ jobs:
           PYEOF
 
       - name: Convert
-        run: python convert.py --out out
+        run: python convert.py --out out --no-fp16
 
       - name: Keep the log
         if: always()
