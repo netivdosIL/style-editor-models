@@ -73,6 +73,19 @@ def main():
     tot_audio = sum(len(c[1]) for c in clips) / 16000
     log("   clips:", len(clips), "| audio %.1f min | avg %.1fs" % (tot_audio / 60, tot_audio / max(1, len(clips))))
 
+    # a few real Hebrew samples (16 kHz wav + reference text) for browser tests
+    try:
+        import soundfile as sf
+        os.makedirs("out", exist_ok=True)
+        with zipfile.ZipFile("out/fleurs_he_samples.zip", "w") as zs:
+            refs = []
+            for fname, x, ref in clips[:6]:
+                b = io.BytesIO(); sf.write(b, x, 16000, format="WAV", subtype="PCM_16")
+                zs.writestr(fname, b.getvalue()); refs.append(fname + "\t" + ref)
+            zs.writestr("refs.tsv", "\n".join(refs) + "\n")
+    except Exception as e:
+        log("   samples not saved: " + str(e)[:200])
+
     so = ort.SessionOptions()
     so.intra_op_num_threads = 1
 

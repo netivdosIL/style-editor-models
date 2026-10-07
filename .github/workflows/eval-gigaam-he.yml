@@ -50,5 +50,7 @@ jobs:
       - name: Publish log
         if: always()
         run: |
-          if [ -f out/eval_log.txt ]; then gh release upload "$TAG" out/eval_log.txt --clobber; fi
+          for f in out/eval_log.txt out/fleurs_he_samples.zip; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber || true
+          done
           cat out/eval_log.txt || true
