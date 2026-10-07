@@ -1,0 +1,216 @@
+# Measures the converted Hebrew model on real Hebrew speech (FLEURS he_il test)
+# and compares it with Whisper Base. Result: eval_log.txt in release gigaam-he-v1.
+name: Evaluate GigaAM-He
+
+on:
+  workflow_dispatch:
+    inputs:
+      clips:
+        description: "Number of test clips"
+        default: "150"
+
+permissions:
+  contents: write
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      N_CLIPS: ${{ inputs.clips }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install onnxruntime==1.23.2 numpy==2.5.3 scipy huggingface_hub==2.1.1 sherpa-onnx
+
+      - name: Write evaluation script
+        run: |
+          cat > eval_he.py <<'PYEOF'
+          """
+          Compare GigaAM-He int8 (our converted model, same feature pipeline as the browser)
+          with Whisper Base (sherpa-onnx, what the editor uses today) on real Hebrew speech
+          (google/fleurs he_il test). Writes eval_log.txt.
+          """
+          import base64, csv, io, json, os, re, sys, tarfile, time, traceback, wave, zipfile, urllib.request
+
+          import numpy as np
+
+          N = int(os.environ.get("N_CLIPS", "150"))
+          LOG = []
+
+
+          def log(*a):
+              s = " ".join(str(x) for x in a)
+              print(s, flush=True)
+              LOG.append(s)
+
+
+          def norm(t):
+              t = re.sub(r"[֑-ׇ]", "", t)
+              t = re.sub(r"[^א-ת0-9a-zA-Z ]", " ", t)
+              return " ".join(t.split())
+
+
+          def lev(a, b):
+              prev = list(range(len(b) + 1))
+              for i in range(1, len(a) + 1):
+                  cur = [i] + [0] * len(b)
+                  for j in range(1, len(b) + 1):
+                      cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+                  prev = cur
+              return prev[-1]
+
+
+          def fetch(url, path):
+              if not os.path.exists(path):
+                  urllib.request.urlretrieve(url, path)
+              return path
+
+
+          def main():
+              import onnxruntime as ort
+              from huggingface_hub import hf_hub_download
+
+              # ---------- data ----------
+              log("1. FLEURS he_il test")
+              tsv = hf_hub_download("google/fleurs", "data/he_il/test.tsv", repo_type="dataset")
+              tgz = hf_hub_download("google/fleurs", "data/he_il/audio/test.tar.gz", repo_type="dataset")
+              rows = []
+              with open(tsv, encoding="utf-8") as f:
+                  for r in csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE):
+                      if len(r) >= 3:
+                          rows.append((r[1], r[2]))
+              want = {fn: txt for fn, txt in rows}
+              clips = []
+              with tarfile.open(tgz) as tf:
+                  for m in tf:
+                      if not m.isfile():
+                          continue
+                      base = os.path.basename(m.name)
+                      if base in want:
+                          data = tf.extractfile(m).read()
+                          w = wave.open(io.BytesIO(data))
+                          sr = w.getframerate()
+                          x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+                          if w.getnchannels() > 1:
+                              x = x.reshape(-1, w.getnchannels()).mean(1)
+                          if sr != 16000:
+                              from scipy.signal import resample_poly
+                              x = resample_poly(x, 16000, sr).astype(np.float32)
+                          clips.append((base, x, want[base]))
+                      if len(clips) >= N:
+                          break
+              tot_audio = sum(len(c[1]) for c in clips) / 16000
+              log("   clips:", len(clips), "| audio %.1f min | avg %.1fs" % (tot_audio / 60, tot_audio / max(1, len(clips))))
+
+              so = ort.SessionOptions()
+              so.intra_op_num_threads = 1
+
+              # ---------- GigaAM-He int8 ----------
+              log("2. GigaAM-He int8 (browser pipeline: numpy log-mel + onnxruntime)")
+              zp = fetch("https://github.com/netivdosIL/style-editor-models/releases/download/gigaam-he-v1/hebrew-gigaam-int8.zip", "gigaam.zip")
+              z = zipfile.ZipFile(zp)
+              info = json.loads(z.read("model_info.json"))
+              z.extract(info["file"], "gigaam")
+              F = info["features"]
+              f32 = lambda b: np.frombuffer(base64.b64decode(b), dtype=np.float32)
+              win = f32(F["window_b64"])
+              fb = f32(F["mel_fb_b64"]).reshape(F["n_freqs"], F["n_mels"])
+              nfft, hop, wl = F["n_fft"], F["hop_length"], F["win_length"]
+              wfull = np.zeros(nfft, np.float32)
+              o = (nfft - wl) // 2
+              wfull[o:o + wl] = win
+
+              def mel(x):
+                  if F["center"]:
+                      x = np.pad(x, (nfft // 2, nfft // 2), mode="reflect")
+                  T = (len(x) - nfft) // hop + 1
+                  idx = np.arange(nfft)[None, :] + hop * np.arange(T)[:, None]
+                  p = np.abs(np.fft.rfft(x[idx] * wfull, n=nfft)) ** 2
+                  return np.log(np.clip(p @ fb, F["log_clamp_min"], F["log_clamp_max"])).T.astype(np.float32)
+
+              sess = ort.InferenceSession(os.path.join("gigaam", info["file"]), so, providers=["CPUExecutionProvider"])
+              vocab, blank = info["vocab"], info["blank_id"]
+
+              def giga(x):
+                  f = mel(x)[None]
+                  lp = sess.run(None, {"features": f, "feature_lengths": np.array([f.shape[2]], np.int64)})[0][0]
+                  ids = lp.argmax(-1)
+                  out, prev = [], -1
+                  for i in ids:
+                      if i != prev and i != blank:
+                          out.append(vocab[i])
+                      prev = i
+                  return "".join(out)
+
+              # ---------- Whisper Base (sherpa-onnx, as in the editor) ----------
+              whisper = None
+              try:
+                  import sherpa_onnx
+
+                  log("3. Whisper Base (sherpa-onnx int8, language he)")
+                  tb = fetch("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2", "wb.tar.bz2")
+                  with tarfile.open(tb) as tf:
+                      tf.extractall("wb")
+                  d = [os.path.join(r, "") for r, _, fs in os.walk("wb") if any(f.endswith("tokens.txt") for f in fs)][0]
+                  fs = os.listdir(d)
+                  enc = d + next(f for f in fs if f.endswith("encoder.int8.onnx"))
+                  dec = d + next(f for f in fs if f.endswith("decoder.int8.onnx"))
+                  tok = d + next(f for f in fs if f.endswith("tokens.txt"))
+                  whisper = sherpa_onnx.OfflineRecognizer.from_whisper(encoder=enc, decoder=dec, tokens=tok, language="he", task="transcribe", num_threads=1)
+              except Exception:
+                  log("   whisper setup failed:\n" + traceback.format_exc())
+
+              def wsp(x):
+                  s = whisper.create_stream()
+                  s.accept_waveform(16000, x)
+                  whisper.decode_stream(s)
+                  return s.result.text
+
+              # ---------- run ----------
+              systems = [("GigaAM-He int8", giga)] + ([("Whisper Base", wsp)] if whisper else [])
+              for name, fn in systems:
+                  we = wn = ce = cn = 0
+                  t_all = 0.0
+                  examples = []
+                  for k, (fname, x, ref) in enumerate(clips):
+                      t0 = time.time()
+                      hyp = fn(x)
+                      t_all += time.time() - t0
+                      r, h = norm(ref), norm(hyp)
+                      we += lev(r.split(), h.split()); wn += len(r.split())
+                      ce += lev(list(r.replace(" ", "")), list(h.replace(" ", ""))); cn += len(r.replace(" ", ""))
+                      if k < 6:
+                          examples.append((ref, hyp))
+                  log("== %s: WER %.1f%% | CER %.1f%% | %.3f sec per audio sec (1 thread)" % (name, 100 * we / wn, 100 * ce / cn, t_all / tot_audio))
+                  for ref, hyp in examples:
+                      log("   ref: " + norm(ref))
+                      log("   hyp: " + norm(hyp))
+              log("DONE")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  log("FAILED:\n" + traceback.format_exc())
+              finally:
+                  os.makedirs("out", exist_ok=True)
+                  open("out/eval_log.txt", "w", encoding="utf-8").write("\n".join(LOG) + "\n")
+          PYEOF
+
+      - name: Evaluate
+        run: python eval_he.py
+
+      - name: Publish log
+        if: always()
+        run: |
+          if [ -f out/eval_log.txt ]; then gh release upload gigaam-he-v1 out/eval_log.txt --clobber; fi
+          cat out/eval_log.txt || true
