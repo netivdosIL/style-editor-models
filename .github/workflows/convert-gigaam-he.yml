@@ -60,5 +60,10 @@ jobs:
           fi
           shopt -s nullglob
           files=(out/*.zip out/*.part* out/*.parts.json out/convert_log.txt)
-          if [ ${#files[@]} -gt 0 ]; then gh release upload "$TAG" "${files[@]}" --clobber; fi
+          for f in "${files[@]}"; do
+            for try in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --clobber; then echo "uploaded $f"; break; fi
+              echo "retry $f ($try)"; sleep $((try * 10))
+            done
+          done
           [ -n "$(ls out/*.zip 2>/dev/null)" ] || { echo "conversion failed - see convert_log.txt in the release"; exit 1; }
