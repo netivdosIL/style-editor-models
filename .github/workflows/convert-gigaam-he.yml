@@ -1,0 +1,438 @@
+# Converts the Hebrew speech model GigaAM-He (asfberlin/fast-hebrew-asr, MIT)
+# to ONNX for the style editor, and publishes it as release "gigaam-he-v1".
+# Run it from the Actions tab: "Convert GigaAM-He" -> "Run workflow".
+name: Convert GigaAM-He
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install libraries
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python -m pip install --upgrade pip
+          pip install torch==2.14.1 torchaudio==2.11.0
+          pip install onnx==1.19.1 onnxruntime==1.23.2 onnxconverter-common==1.16.0 huggingface_hub==2.1.1 numpy==2.5.3 soundfile
+          pip install "gigaam @ git+https://github.com/salute-developers/GigaAM@7447938d791c4f3e643386ee22c33777004293a5"
+          python -c "import torch, torchaudio, gigaam, onnx, onnxruntime; print('libraries ok', torch.__version__)"
+
+      - name: Write conversion script
+        run: |
+          cat > convert.py <<'PYEOF'
+          """
+          Convert asfberlin/fast-hebrew-asr (GigaAM-He, character CTC) to ONNX for the browser.
+
+          Output (in --out):
+            hebrew-gigaam-int8.zip  : model.int8.onnx + model_info.json + test_vectors.json + CREDITS.txt
+            hebrew-gigaam-fp16.zip  : model.fp16.onnx + same json files (for GPU use later)
+            convert_log.txt
+          """
+          import argparse, base64, hashlib, json, math, os, shutil, sys, time, traceback, zipfile
+
+          import numpy as np
+
+          LOG = []
+
+
+          def log(*a):
+              s = " ".join(str(x) for x in a)
+              print(s, flush=True)
+              LOG.append(s)
+
+
+          def b64f32(arr):
+              a = np.ascontiguousarray(np.asarray(arr, dtype=np.float32))
+              return base64.b64encode(a.tobytes()).decode("ascii")
+
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def ctc_greedy(logp, blank, vocab):
+              ids = logp.argmax(-1)
+              out, prev = [], -1
+              for i in ids:
+                  i = int(i)
+                  if i != prev and i != blank:
+                      out.append(vocab[i] if i < len(vocab) else "")
+                  prev = i
+              return "".join(out), ids
+
+
+          CREDITS = """Hebrew speech model for the style editor (offline voice typing)
+
+          Model: GigaAM-He (asfberlin/fast-hebrew-asr), MIT License.
+          Base: GigaAM v2 multilingual_ssl, (c) 2024 GigaChat Team, MIT License
+                https://github.com/salute-developers/GigaAM
+          Training data credits:
+            - HebDB (SLPRL-HUJI/HebDB), CC-BY-4.0
+            - ivrit.ai crowd-transcribe-v5 (license permits commercial training)
+          This package: converted to ONNX (int8 / fp16) without retraining.
+
+          MIT License text (applies to the model weights and GigaAM code):
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+          """
+
+
+          def make_test_audio(sr):
+              """Deterministic 3.2 s test signal (speech-like bursts), used only for parity checks."""
+              rng = np.random.default_rng(1234)
+              t = np.arange(int(sr * 3.2)) / sr
+              x = np.zeros_like(t)
+              for k, (start, f0) in enumerate([(0.2, 140), (0.9, 180), (1.6, 120), (2.3, 160)]):
+                  seg = (t >= start) & (t < start + 0.55)
+                  tt = t[seg] - start
+                  env = np.sin(np.pi * tt / 0.55) ** 2
+                  f = f0 * (1 + 0.15 * np.sin(2 * np.pi * 3 * tt))
+                  ph = 2 * np.pi * np.cumsum(f) / sr
+                  sig = sum(np.sin(h * ph) / h for h in range(1, 12))
+                  x[seg] += env * sig * 0.3
+              x += rng.normal(0, 0.003, size=x.shape)
+              return x.astype(np.float32)
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--repo", default="asfberlin/fast-hebrew-asr")
+              ap.add_argument("--ckpt", default=None, help="local checkpoint (testing only)")
+              ap.add_argument("--vocab", default=None, help="local vocab.json (testing only)")
+              ap.add_argument("--out", default="out")
+              ap.add_argument("--no-fp16", action="store_true")
+              args = ap.parse_args()
+
+              os.makedirs(args.out, exist_ok=True)
+              work = os.path.join(args.out, "work")
+              os.makedirs(work, exist_ok=True)
+              t_start = time.time()
+
+              import torch
+              import gigaam
+
+              log("python", sys.version.split()[0], "| torch", torch.__version__)
+              import onnx, onnxruntime as ort
+              log("onnx", onnx.__version__, "| onnxruntime", ort.__version__)
+
+              # ---------- 1. download ----------
+              source = {"repo": args.repo}
+              if args.ckpt:
+                  ckpt_path = args.ckpt
+                  repo_vocab_path = args.vocab
+                  source["revision"] = "local-test"
+              else:
+                  from huggingface_hub import HfApi, hf_hub_download
+
+                  info = HfApi().model_info(args.repo)
+                  rev = info.sha
+                  source["revision"] = rev
+                  log("1. downloading", args.repo, "@", rev)
+                  if info.siblings:
+                      files = [s.rfilename for s in info.siblings]
+                  else:
+                      files = HfApi().list_repo_files(args.repo, revision=rev)
+                  log("   files:", ", ".join(files))
+                  ckpt_name = next((f for f in files if f.endswith(".ckpt")), None)
+                  if not ckpt_name:
+                      raise RuntimeError("no .ckpt file in the repo")
+                  ckpt_path = hf_hub_download(args.repo, ckpt_name, revision=rev)
+                  repo_vocab_path = hf_hub_download(args.repo, "vocab.json", revision=rev) if "vocab.json" in files else None
+                  if "config.json" in files:
+                      cfgp = hf_hub_download(args.repo, "config.json", revision=rev)
+                      log("   config.json:", open(cfgp, encoding="utf-8").read().replace("\n", " ")[:600])
+              log("   checkpoint:", ckpt_path, "%.0f MB" % (os.path.getsize(ckpt_path) / 1e6))
+
+              # ---------- 2. load ----------
+              log("2. loading the model")
+              try:
+                  model = gigaam.load_model(ckpt_path, fp16_encoder=False, device="cpu")
+              except Exception:
+                  log("   load_model failed:\n" + traceback.format_exc())
+                  ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                  log("   checkpoint keys:", list(ck.keys()))
+                  hp = ck.get("hyper_parameters", {})
+                  log("   hyper_parameters keys:", list(hp.keys()) if hasattr(hp, "keys") else type(hp))
+                  raise
+              model = model.float().eval()
+              cfg = model.cfg
+              log("   class:", type(model).__name__, "| model_name:", cfg.get("model_name"))
+              if not hasattr(model, "head") or "CTCHead" not in type(model.head).__name__:
+                  raise RuntimeError("expected a CTC model, got head " + type(getattr(model, "head", None)).__name__)
+              vocab = list(cfg.decoding.vocabulary)
+              blank = len(vocab)
+              log("   vocab:", len(vocab), "chars, blank id", blank)
+              if repo_vocab_path:
+                  rv = json.load(open(repo_vocab_path, encoding="utf-8"))
+                  log("   vocab.json matches the checkpoint:", rv == vocab)
+              nparams = sum(p.numel() for p in model.parameters())
+              log("   parameters: %.1fM" % (nparams / 1e6))
+
+              # ---------- 3. feature extractor parameters ----------
+              pre = model.preprocessor
+              mel = pre.featurizer[0]
+              spec = mel.spectrogram
+              fb = mel.mel_scale.fb.detach().cpu().numpy()  # (n_freqs, n_mels)
+              window = spec.window.detach().cpu().numpy()
+              sr = int(cfg.preprocessor.get("sample_rate", 16000))
+              feat = {
+                  "sample_rate": sr,
+                  "n_fft": int(spec.n_fft),
+                  "win_length": int(spec.win_length),
+                  "hop_length": int(spec.hop_length),
+                  "center": bool(spec.center),
+                  "pad_mode": str(spec.pad_mode),
+                  "power": float(spec.power),
+                  "normalized": bool(spec.normalized) if not isinstance(spec.normalized, str) else spec.normalized,
+                  "n_mels": int(fb.shape[1]),
+                  "n_freqs": int(fb.shape[0]),
+                  "log_clamp_min": 1e-9,
+                  "log_clamp_max": 1e9,
+                  "window_b64": b64f32(window),
+                  "mel_fb_b64": b64f32(fb),
+              }
+              log("3. features:", {k: v for k, v in feat.items() if not k.endswith("_b64")})
+              if feat["normalized"] not in (False, "False", "frame_length", "window") or feat["power"] != 2.0:
+                  log("   WARNING: unusual spectrogram settings")
+
+              class Wrap(torch.nn.Module):
+                  def __init__(self, m):
+                      super().__init__()
+                      self.m = m
+
+                  def forward(self, features, feature_lengths):
+                      enc, enc_len = self.m.encoder(features, feature_lengths)
+                      return self.m.head(enc), enc_len
+
+              wrap = Wrap(model).eval()
+              # ---------- 3b. torch reference on a test signal ----------
+              log("3b. torch reference")
+              audio = None
+              audio_name = "synthetic"
+              try:
+                  from gigaam.utils import download_short_audio
+                  from gigaam.preprocess import load_audio
+
+                  p = download_short_audio()
+                  a = load_audio(p).numpy()
+                  audio = a[: sr * 8].astype(np.float32)
+                  audio_name = "gigaam example (Russian speech, used only to compare engines)"
+              except Exception as e:
+                  log("   example audio not available (" + str(e)[:120] + "), using a synthetic signal")
+              if audio is None:
+                  audio = make_test_audio(sr)
+
+              with torch.no_grad():
+                  wav = torch.from_numpy(audio)[None, :]
+                  feats, flen = pre(wav, torch.tensor([wav.shape[1]]))
+                  feats_np = feats.numpy().astype(np.float32)
+                  lp_torch, elen = wrap(feats, flen)
+                  lp_torch = lp_torch.numpy()
+              text_torch, ids_torch = ctc_greedy(lp_torch[0], blank, vocab)
+              log("   audio:", audio_name, "%.1fs" % (len(audio) / sr), "| features", feats_np.shape)
+              log("   torch :", repr(text_torch))
+
+              # ---------- 4. export ONNX fp32 ----------
+              fp32_path = os.path.join(work, "model.onnx")
+              ex_feat = torch.randn(1, feat["n_mels"], 400)
+              ex_len = torch.tensor([400], dtype=torch.int64)
+              log("4. exporting ONNX (fp32)")
+              t0 = time.time()
+              import warnings
+
+              with model.encoder.onnx_export_mode(), torch.no_grad(), warnings.catch_warnings():
+                  warnings.simplefilter("ignore")
+                  torch.onnx.export(
+                      wrap, (ex_feat, ex_len), fp32_path,
+                      input_names=["features", "feature_lengths"],
+                      output_names=["log_probs", "encoded_lengths"],
+                      dynamic_axes={
+                          "features": {0: "batch", 2: "frames"},
+                          "feature_lengths": {0: "batch"},
+                          "log_probs": {0: "batch", 1: "out_frames"},
+                          "encoded_lengths": {0: "batch"},
+                      },
+                      opset_version=17,
+                      dynamo=False,
+                  )
+              log("   done in %.0fs, %.0f MB" % (time.time() - t0, os.path.getsize(fp32_path) / 1e6))
+              onnx.checker.check_model(fp32_path)
+              import gc
+              nparams_keep = nparams
+              del wrap, model, mel, spec, pre
+              gc.collect()
+
+              # ---------- 5. int8 ----------
+              from onnxruntime.quantization import QuantType, quantize_dynamic
+
+              int8_path = os.path.join(work, "model.int8.onnx")
+              log("5. quantizing to int8 (MatMul weights)")
+              t0 = time.time()
+              quantize_dynamic(fp32_path, int8_path, weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul", "Gemm"])
+              log("   done in %.0fs, %.0f MB" % (time.time() - t0, os.path.getsize(int8_path) / 1e6))
+
+              # ---------- 6. fp16 ----------
+              fp16_path = None
+              if not args.no_fp16:
+                  try:
+                      import subprocess
+
+                      log("6. converting to fp16")
+                      fp16_path = os.path.join(work, "model.fp16.onnx")
+                      code = ("import onnx,sys;from onnxconverter_common import float16;"
+                              "m=float16.convert_float_to_float16(onnx.load(sys.argv[1]),keep_io_types=True);onnx.save(m,sys.argv[2])")
+                      r = subprocess.run([sys.executable, "-W", "ignore", "-c", code, fp32_path, fp16_path], capture_output=True, text=True)
+                      if r.returncode != 0 or not os.path.exists(fp16_path):
+                          raise RuntimeError("fp16 conversion process failed (code %s): %s" % (r.returncode, r.stderr[-800:]))
+                      log("   %.0f MB" % (os.path.getsize(fp16_path) / 1e6))
+                  except Exception:
+                      log("   fp16 failed (skipped):\n" + traceback.format_exc())
+                      fp16_path = None
+
+              log("7. parity tests (onnxruntime vs torch)")
+              results = {}
+              so = ort.SessionOptions()
+              so.intra_op_num_threads = 1
+              for name, path in [("fp32", fp32_path), ("int8", int8_path), ("fp16", fp16_path)]:
+                  if not path:
+                      continue
+                  s = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+                  t0 = time.time()
+                  lp = s.run(None, {"features": feats_np, "feature_lengths": np.array([feats_np.shape[2]], dtype=np.int64)})[0]
+                  dt = time.time() - t0
+                  txt, ids = ctc_greedy(lp[0], blank, vocab)
+                  agree = float((ids == ids_torch).mean())
+                  diff = float(np.abs(lp[0] - lp_torch[0]).mean())
+                  results[name] = {"text": txt, "argmax_agree": agree, "mean_abs_diff": diff, "sec": dt, "logp": lp[0]}
+                  log("   %-5s: %r | same frames %.1f%% | mean diff %.4f | %.2fs (1 thread, %.1fs audio)"
+                      % (name, txt, agree * 100, diff, dt, len(audio) / sr))
+                  del s
+              if results["fp32"]["argmax_agree"] < 0.99:
+                  raise RuntimeError("ONNX fp32 does not match torch - export problem")
+              if results["int8"]["argmax_agree"] < 0.9:
+                  log("   WARNING: int8 differs a lot from torch")
+
+              nfr = min(40, lp_torch.shape[1])
+              tv = {
+                  "audio_note": audio_name,
+                  "audio_b64": b64f32(audio),
+                  "features_shape": list(feats_np.shape[1:]),
+                  "features_b64": b64f32(feats_np[0]),
+                  "torch_text": text_torch,
+                  "torch_argmax": [int(i) for i in ids_torch],
+              }
+
+              def model_info(file_name, variant):
+                  return {
+                      "name": "GigaAM-He (fast-hebrew-asr)",
+                      "variant": variant,
+                      "file": file_name,
+                      "source": source,
+                      "license": "MIT (model + GigaAM); training data credits in CREDITS.txt",
+                      "type": "ctc",
+                      "inputs": {"features": "float32 [1, n_mels, frames]", "feature_lengths": "int64 [1]"},
+                      "outputs": {"log_probs": "float32 [1, out_frames, vocab+1]", "encoded_lengths": "int64 [1]"},
+                      "subsampling_factor": int(cfg.encoder.get("subsampling_factor", 4)),
+                      "max_seconds": 20,
+                      "vocab": vocab,
+                      "blank_id": blank,
+                      "features": feat,
+                      "parameters_millions": round(nparams / 1e6, 1),
+                  }
+
+              # ---------- 8. package ----------
+              log("8. packaging")
+              out_files = []
+              for variant, path, zname in [("int8", int8_path, "hebrew-gigaam-int8.zip"), ("fp16", fp16_path, "hebrew-gigaam-fp16.zip")]:
+                  if not path:
+                      continue
+                  fname = os.path.basename(path)
+                  info = model_info(fname, variant)
+                  info["sha256"] = sha256(path)
+                  info["size_bytes"] = os.path.getsize(path)
+                  r = results[variant]
+                  tvv = dict(tv)
+                  tvv["expected_text"] = r["text"]
+                  tvv["expected_argmax"] = [int(i) for i in r["logp"].argmax(-1)]
+                  tvv["expected_logp_first_frames"] = nfr
+                  tvv["expected_logp_b64"] = b64f32(r["logp"][:nfr])
+                  zpath = os.path.join(args.out, zname)
+                  with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as z:
+                      z.write(path, fname)
+                      z.writestr("model_info.json", json.dumps(info, ensure_ascii=False, indent=1))
+                      z.writestr("test_vectors.json", json.dumps(tvv, ensure_ascii=False))
+                      z.writestr("CREDITS.txt", CREDITS)
+                  out_files.append(zpath)
+                  log("   %s  %.0f MB" % (zname, os.path.getsize(zpath) / 1e6))
+
+              log("DONE in %.0f min" % ((time.time() - t_start) / 60))
+              shutil.rmtree(work, ignore_errors=True)
+              return out_files
+
+
+          if __name__ == "__main__":
+              ok = True
+              try:
+                  main()
+              except Exception:
+                  ok = False
+                  log("FAILED:\n" + traceback.format_exc())
+              finally:
+                  out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else "out"
+                  os.makedirs(out, exist_ok=True)
+                  with open(os.path.join(out, "convert_log.txt"), "w", encoding="utf-8") as f:
+                      f.write("\n".join(LOG) + "\n")
+              sys.exit(0 if ok else 1)
+          PYEOF
+
+      - name: Convert
+        run: python convert.py --out out
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: convert-log
+          path: out/convert_log.txt
+          if-no-files-found: warn
+
+      - name: Publish release gigaam-he-v1
+        run: |
+          TAG=gigaam-he-v1
+          ls -la out
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "GigaAM-He Hebrew speech model (ONNX)" \
+              --notes "Converted from asfberlin/fast-hebrew-asr (MIT). Credits: GigaAM (MIT), HebDB (CC-BY-4.0), ivrit.ai crowd-transcribe-v5. See CREDITS.txt inside each zip."
+          fi
+          gh release upload "$TAG" out/*.zip out/convert_log.txt --clobber
+          echo "Published: https://github.com/$GH_REPO/releases/tag/$TAG"
