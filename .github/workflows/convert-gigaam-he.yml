@@ -427,6 +427,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Publish release gigaam-he-v1
+        if: always()
         run: |
           TAG=gigaam-he-v1
           ls -la out
@@ -434,5 +435,8 @@ jobs:
             gh release create "$TAG" --title "GigaAM-He Hebrew speech model (ONNX)" \
               --notes "Converted from asfberlin/fast-hebrew-asr (MIT). Credits: GigaAM (MIT), HebDB (CC-BY-4.0), ivrit.ai crowd-transcribe-v5. See CREDITS.txt inside each zip."
           fi
-          gh release upload "$TAG" out/*.zip out/convert_log.txt --clobber
+          shopt -s nullglob
+          files=(out/*.zip out/convert_log.txt)
+          if [ ${#files[@]} -gt 0 ]; then gh release upload "$TAG" "${files[@]}" --clobber; fi
+          [ -n "$(ls out/*.zip 2>/dev/null)" ] || { echo "conversion failed - see convert_log.txt in the release"; exit 1; }
           echo "Published: https://github.com/$GH_REPO/releases/tag/$TAG"
