@@ -54,7 +54,7 @@ html='''<!DOCTYPE html>
     if(NEED && s.indexOf(NEED.mark) === -1) return { error: NEED.msg };
     for(var g = 0; g < STEPS.length; g++){
       var grp = STEPS[g];
-      if(grp.skipIf && s.indexOf(grp.skipIf) !== -1) continue;   // this part is already in the file
+      if(grp.skipIf && [].concat(grp.skipIf).some(m => s.indexOf(m) !== -1)) continue;   // this part is already in the file
       for(var k = 0; k < grp.steps.length; k++){
         var st = grp.steps[k], n = count(s, st.find);
         if(n !== 1) return { error:'לא נמצא המקום לעדכון: ' + st.name + ' (' + n + '). כנראה זו גרסה אחרת של העורך – שלחו אותה ל-Claude.' };
