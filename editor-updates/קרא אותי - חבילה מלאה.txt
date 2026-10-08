@@ -23,20 +23,18 @@ hebrew-punct-model.zip               – פיסוק AI
 hebrew-gimmel-small-model.zip        – הגהה AI, קל (למחשב חלש)
 hebrew-gimmel-model.zip              – הגהה AI, מלא (מדויק יותר)
 nakdimon-0.2.1-py3-none-any.whl      – ניקוד AI
-hebrew-gigaam-int8.zip.part01        – הקלדה קולית בלי אינטרנט: "עברית מדויק" (מומלץ), חלק 1
+hebrew-gigaam-int8.zip.part01        – הקלדה קולית בלי אינטרנט: "עברית מדויק", חלק 1
 hebrew-gigaam-int8.zip.part02        – "עברית מדויק", חלק 2
 hebrew-gigaam-int8.zip.part03        – "עברית מדויק", חלק 3
 hebrew-gigaam-int8.zip.part04        – "עברית מדויק", חלק 4
 hebrew-gigaam-int8.zip.part05        – "עברית מדויק", חלק 5
 hebrew-gigaam-int8.zip.parts.json    – "עברית מדויק", רשימת החלקים (צריך את כל 6 הקבצים)
-sherpa-onnx-whisper-tiny.tar.bz2     – הקלדה קולית בלי אינטרנט, Tiny (לא חובה)
-sherpa-onnx-whisper-base.tar.bz2     – הקלדה קולית בלי אינטרנט, Base (לא חובה)
 
 אין לשנות את שמות הקבצים.
 
-"עברית מדויק" הוא מודל זיהוי דיבור שאומן על עברית, והוא מדויק ומהיר יותר
-מ-Tiny ומ-Base. אחרי ההתקנה הוא נבחר לבד. Tiny ו-Base נשארים לבחירה בחלון
-⚙️ של ההקלדה האופליין, ואפשר גם לוותר עליהם בחבילה.
+"עברית מדויק" הוא מודל זיהוי דיבור שאומן על עברית. הוא עובד בתוך המחשב,
+בלי אינטרנט. הקבצים sherpa-onnx-whisper-*.tar.bz2 מחבילות קודמות כבר לא בשימוש,
+ואפשר למחוק אותם מהתיקייה.
 
 קוד הפעלה
 ---------
