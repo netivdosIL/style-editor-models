@@ -1,7 +1,9 @@
 import sys, json, importlib.util
 spec=importlib.util.spec_from_file_location('st',sys.argv[1]); st=importlib.util.module_from_spec(spec); spec.loader.exec_module(st)
 title, sub, out, fnname = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-steps=[{'name':n,'find':f,'repl':r} for n,f,r in st.STEPS]
+groups=getattr(st,'GROUPS',None)
+if groups: steps=[{'skipIf':gm,'steps':[{'name':n,'find':f,'repl':r} for n,f,r in gs]} for gm,gs in groups]
+else: steps=[{'skipIf':None,'steps':[{'name':n,'find':f,'repl':r} for n,f,r in st.STEPS]}]
 need=getattr(st,'NEED',None)
 html='''<!DOCTYPE html>
 <html lang="he" dir="rtl">
@@ -50,10 +52,14 @@ html='''<!DOCTYPE html>
     if(s.indexOf('id="offline-modal"') === -1 || s.indexOf('id="whisper-offline-core"') === -1)
       return { error:'זה לא נראה כמו קובץ העורך. בחרו את "עורך סגנונות.html".' };
     if(NEED && s.indexOf(NEED.mark) === -1) return { error: NEED.msg };
-    for(var k = 0; k < STEPS.length; k++){
-      var st = STEPS[k], n = count(s, st.find);
-      if(n !== 1) return { error:'לא נמצא המקום לעדכון: ' + st.name + ' (' + n + '). כנראה זו גרסה אחרת של העורך – שלחו אותה ל-Claude.' };
-      s = s.replace(st.find, function(){ return st.repl; });
+    for(var g = 0; g < STEPS.length; g++){
+      var grp = STEPS[g];
+      if(grp.skipIf && s.indexOf(grp.skipIf) !== -1) continue;   // this part is already in the file
+      for(var k = 0; k < grp.steps.length; k++){
+        var st = grp.steps[k], n = count(s, st.find);
+        if(n !== 1) return { error:'לא נמצא המקום לעדכון: ' + st.name + ' (' + n + '). כנראה זו גרסה אחרת של העורך – שלחו אותה ל-Claude.' };
+        s = s.replace(st.find, function(){ return st.repl; });
+      }
     }
     return { text: crlf ? s.replace(/\\n/g, '\\r\\n') : s };
   }
