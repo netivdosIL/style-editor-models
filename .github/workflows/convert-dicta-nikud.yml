@@ -41,7 +41,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers onnx==1.19.1 onnxruntime==1.23.2 huggingface_hub numpy safetensors
+          pip install "transformers==4.46.3" onnx==1.19.1 onnxruntime==1.23.2 huggingface_hub numpy safetensors
           python -c "import torch, transformers, onnx, onnxruntime; print('libraries ok', torch.__version__, transformers.__version__)"
 
       - name: Convert

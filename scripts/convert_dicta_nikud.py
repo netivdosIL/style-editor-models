@@ -30,54 +30,54 @@ def clean_gold(s):
     s = re.sub(r'[^ְ-ׇא-ת \.,;:?!\-"\']', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
-def sefaria_sentences(limit_per_book):
-    """Vocalized gold text from Sefaria-Export (sparse clone, only the files we need)."""
+def gold_sentences(limit_per_book):
+    """Vocalized gold text: Tanakh from openscriptures/morphhb (WLC, public domain) and the modern vocalized
+    texts that Nakdimon is tested on (elazarg/hebrew_diacritized)."""
     out = {}
+    def take(key, segs, src):
+        sents = []
+        for seg in segs:
+            seg = clean_gold(seg)
+            for part in re.split(r'(?<=[\.:;?!])\s+', seg):
+                part = part.strip(' -')
+                if 4 <= len(part.split()) <= 30 and len(NIQQUD.findall(part)) > len(part) * 0.25: sents.append(part)
+        random.Random(7).shuffle(sents)
+        out[key] = {'source': src, 'sentences': sents[:limit_per_book]}
+        log(key, 'from', src, len(out[key]['sentences']), 'sentences')
     try:
-        if not os.path.isdir('sefaria'):
-            subprocess.run(['git', 'clone', '--depth', '1', '--filter=blob:none', '--no-checkout',
-                            'https://github.com/Sefaria/Sefaria-Export', 'sefaria'], check=True)
-        names = subprocess.run(['git', '-C', 'sefaria', 'ls-tree', '-r', '--name-only', 'HEAD'],
-                               check=True, capture_output=True, text=True).stdout.splitlines()
-        log('files in export:', len(names), 'sample:', [n for n in names if '/Ruth/' in n][:10], [n for n in names if 'Berakhot' in n and 'Mishnah' in n][:10])
-        want = {
-            'tanakh_ruth':   r'/Ruth/Hebrew/[^/]*\.json$',
-            'tanakh_genesis': r'/Torah/Genesis/Hebrew/[^/]*\.json$',
-            'mishnah_berakhot': r'/Mishnah Berakhot/Hebrew/[^/]*\.json$',
-            'mishnah_avot': r'/Pirkei Avot/Hebrew/[^/]*\.json$',
-        }
-        for key, rx in want.items():
-            cands = [n for n in names if re.search(rx, n)]
-            log(key, 'candidates:', cands[:12])
-            best = None
-            for n in cands:
-                subprocess.run(['git', '-C', 'sefaria', 'checkout', 'HEAD', '--', n], check=True, capture_output=True)
-                try: data = json.load(open(os.path.join('sefaria', n), encoding='utf-8'))
-                except Exception as e: log('  cannot read', n, e); continue
-                txt = data.get('text')
-                flat = []
-                def walk(x):
-                    if isinstance(x, str): flat.append(x)
-                    elif isinstance(x, list):
-                        for y in x: walk(y)
-                walk(txt)
-                joined = ' '.join(flat)
-                letters = len(re.findall('[א-ת]', joined)) or 1
-                ratio = len(NIQQUD.findall(joined)) / letters
-                log('  ', n, 'segments', len(flat), 'niqqud/letter %.2f' % ratio)
-                if ratio > 0.6 and (best is None or ratio > best[0]): best = (ratio, n, flat)
-            if best:
-                sents = []
-                for seg in best[2]:
-                    seg = clean_gold(seg)
-                    for part in re.split(r'(?<=[\.:;?!])\s+', seg):
-                        part = part.strip(' -')
-                        if 4 <= len(part.split()) <= 30 and len(NIQQUD.findall(part)) > len(part) * 0.25: sents.append(part)
-                random.Random(7).shuffle(sents)
-                out[key] = {'source': best[1], 'sentences': sents[:limit_per_book]}
-                log(key, 'using', best[1], len(out[key]['sentences']), 'sentences')
+        if not os.path.isdir('morphhb'):
+            subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/openscriptures/morphhb', 'morphhb'], check=True, capture_output=True)
+        for book, key in (('Ruth', 'tanakh_ruth'), ('Gen', 'tanakh_genesis'), ('Esth', 'tanakh_esther')):
+            f = os.path.join('morphhb', 'wlc', book + '.xml')
+            if not os.path.exists(f): log('missing', f); continue
+            xml = open(f, encoding='utf-8').read()
+            verses = []
+            for v in re.findall(r'<verse[^>]*>(.*?)</verse>', xml, re.S):
+                v = re.sub(r'<note.*?</note>', ' ', v, flags=re.S)
+                words = re.findall(r'<w[^>]*>(.*?)</w>', v, re.S)
+                verses.append(' '.join(w.replace('/', '') for w in words) + '.')
+            take(key, verses, 'openscriptures/morphhb wlc/' + book + '.xml')
     except Exception as e:
-        log('sefaria eval set failed:', repr(e))
+        log('tanakh gold failed:', repr(e))
+    try:
+        if not os.path.isdir('hd'):
+            subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/elazarg/hebrew_diacritized', 'hd'], check=True, capture_output=True)
+        files = [os.path.join(r, f) for r, _, fs in os.walk('hd') for f in fs if f.endswith('.txt') and '.git' not in r]
+        log('hebrew_diacritized files:', len(files), sorted(set(os.path.relpath(os.path.dirname(f), 'hd') for f in files))[:40])
+        groups = {}
+        for f in files:
+            top = os.path.relpath(f, 'hd').split(os.sep)
+            g = '/'.join(top[:2]) if len(top) > 2 else top[0]
+            groups.setdefault(g, []).append(f)
+        for g, fs in sorted(groups.items()):
+            if not re.search(r'test|modern|dicta|validation', g, re.I): continue
+            segs = []
+            for f in sorted(fs)[:200]:
+                try: segs += open(f, encoding='utf-8').read().splitlines()
+                except Exception: pass
+            take('modern_' + re.sub(r'\W+', '_', g)[:30], segs, 'elazarg/hebrew_diacritized ' + g)
+    except Exception as e:
+        log('modern gold failed:', repr(e))
     return out
 
 MODERN = [   # undiacritized modern sentences (no gold) — to see the output on everyday text
@@ -118,8 +118,8 @@ def run(a):
     with zipfile.ZipFile(os.path.join(a.out, 'dicta-nikud-src.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
         for f in os.listdir(path):
             if not f.endswith('.safetensors'): z.write(os.path.join(path, f), f)
-    from transformers import BertTokenizerFast
-    tok = BertTokenizerFast.from_pretrained(path)   # the fast tokenizer splits into letters (tokenizer.json)
+    tok = AutoTokenizer.from_pretrained(path)
+    assert tok.convert_ids_to_tokens(tok('שלום')['input_ids']) == ['[CLS]', 'ש', 'ל', 'ו', 'ם', '[SEP]'], 'tokenizer does not split into letters'
     model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()
     mod = sys.modules[type(model).__module__]
     NIKUD = getattr(mod, 'NIKUD_CLASSES', None); SHIN = getattr(mod, 'SHIN_CLASSES', None)
@@ -182,7 +182,7 @@ def run(a):
         finally: model.forward = real_forward
     def mpredict(sents): return model.predict(sents, tok, mark_matres_lectionis='')
 
-    gold = sefaria_sentences(a.eval_per_book)
+    gold = gold_sentences(a.eval_per_book)
     allsents = MODERN + [s for g in gold.values() for s in g['sentences']]
     plain = [strip_all(s) for s in allsents]
     B = 16
