@@ -1,0 +1,66 @@
+# Converts Dicta's Hebrew nikud model (dicta-il/dictabert-large-char-menaked, CC BY 4.0)
+# to ONNX for the style editor, evaluates it, and publishes it as a release.
+name: Convert Dicta nikud
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        default: "dicta-nikud-v1"
+      args:
+        description: "Extra arguments for scripts/convert_dicta_nikud.py"
+        default: "--split-mb 50"
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      ARGS: ${{ inputs.args }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers onnx==1.19.1 onnxruntime==1.23.2 huggingface_hub numpy safetensors
+          python -c "import torch, transformers, onnx, onnxruntime; print('libraries ok', torch.__version__, transformers.__version__)"
+
+      - name: Convert
+        run: python scripts/convert_dicta_nikud.py --out out $ARGS
+
+      - name: Publish release
+        if: always()
+        run: |
+          ls -la out || true
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Dicta Hebrew nikud model (ONNX) - $TAG" \
+              --notes "Converted from dicta-il/dictabert-large-char-menaked by DICTA (CC BY 4.0). See NOTICE.txt inside the zip. Parts (*.partNN) are plain byte splits of the zip; *.parts.json lists their sha256."
+          fi
+          shopt -s nullglob
+          files=(out/*.zip out/*.part* out/*.parts.json out/nikud_eval.json out/convert_log.txt)
+          for f in "${files[@]}"; do
+            for try in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --clobber; then echo "uploaded $f"; break; fi
+              echo "retry $f ($try)"; sleep $((try * 10))
+            done
+          done
+          [ -n "$(ls out/hebrew-dicta-nikud.zip 2>/dev/null)" ] || { echo "conversion failed - see convert_log.txt in the release"; exit 1; }
