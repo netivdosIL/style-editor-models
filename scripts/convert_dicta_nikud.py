@@ -39,11 +39,12 @@ def sefaria_sentences(limit_per_book):
                             'https://github.com/Sefaria/Sefaria-Export', 'sefaria'], check=True)
         names = subprocess.run(['git', '-C', 'sefaria', 'ls-tree', '-r', '--name-only', 'HEAD'],
                                check=True, capture_output=True, text=True).stdout.splitlines()
+        log('files in export:', len(names), 'sample:', [n for n in names if '/Ruth/' in n][:10], [n for n in names if 'Berakhot' in n and 'Mishnah' in n][:10])
         want = {
-            'tanakh_ruth':   r'^json/Tanakh/Writings/Ruth/Hebrew/.*\.json$',
-            'tanakh_genesis': r'^json/Tanakh/Torah/Genesis/Hebrew/.*\.json$',
-            'mishnah_berakhot': r'^json/Mishnah/Seder Zeraim/Mishnah Berakhot/Hebrew/.*\.json$',
-            'mishnah_avot': r'^json/Mishnah/Seder Nezikin/Pirkei Avot/Hebrew/.*\.json$',
+            'tanakh_ruth':   r'/Ruth/Hebrew/[^/]*\.json$',
+            'tanakh_genesis': r'/Torah/Genesis/Hebrew/[^/]*\.json$',
+            'mishnah_berakhot': r'/Mishnah Berakhot/Hebrew/[^/]*\.json$',
+            'mishnah_avot': r'/Pirkei Avot/Hebrew/[^/]*\.json$',
         }
         for key, rx in want.items():
             cands = [n for n in names if re.search(rx, n)]
@@ -117,7 +118,8 @@ def run(a):
     with zipfile.ZipFile(os.path.join(a.out, 'dicta-nikud-src.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
         for f in os.listdir(path):
             if not f.endswith('.safetensors'): z.write(os.path.join(path, f), f)
-    tok = AutoTokenizer.from_pretrained(path)
+    from transformers import BertTokenizerFast
+    tok = BertTokenizerFast.from_pretrained(path)   # the fast tokenizer splits into letters (tokenizer.json)
     model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()
     mod = sys.modules[type(model).__module__]
     NIKUD = getattr(mod, 'NIKUD_CLASSES', None); SHIN = getattr(mod, 'SHIN_CLASSES', None)
@@ -125,7 +127,7 @@ def run(a):
     log('NIKUD_CLASSES', NIKUD); log('SHIN_CLASSES', SHIN)
     log('tokenizer', type(tok).__name__, 'max_len', tok.model_max_length, 'vocab', len(tok))
     enc = tok(['שלום עולם'], return_tensors='pt')
-    log('tokens', enc['input_ids'].tolist(), tok.convert_ids_to_tokens(enc['input_ids'][0]))
+    log('tokens', enc['input_ids'].tolist(), tok.convert_ids_to_tokens(enc['input_ids'][0]), 'offsets', tok(['שלום עולם'], return_offsets_mapping=True)['offset_mapping'])
     with torch.no_grad():
         o = model(**enc, return_dict=True)
     log('output type', type(o).__name__, 'fields', [k for k in dir(o) if not k.startswith('_')][:30])
@@ -138,7 +140,7 @@ def run(a):
         raise RuntimeError('unknown logits structure')
     nl, sl = pick(lg)
     log('nikud logits', tuple(nl.shape), 'shin logits', tuple(sl.shape))
-    ref_pred = model.predict(['שָׁלוֹם עוֹלָם', MODERN[0]], tok)
+    ref_pred = model.predict(['שָׁלוֹם עוֹלָם', MODERN[0]], tok, mark_matres_lectionis='')
     log('torch predict sample:', ref_pred)
 
     class W(torch.nn.Module):
@@ -176,8 +178,9 @@ def run(a):
             res = type(o).__new__(type(o)); res.__dict__.update(o.__dict__); res.logits = new
             return res
         model.forward = fwd
-        try: return model.predict(sents, tok)
+        try: return model.predict(sents, tok, mark_matres_lectionis='')
         finally: model.forward = real_forward
+    def mpredict(sents): return model.predict(sents, tok, mark_matres_lectionis='')
 
     gold = sefaria_sentences(a.eval_per_book)
     allsents = MODERN + [s for g in gold.values() for s in g['sentences']]
@@ -185,7 +188,7 @@ def run(a):
     B = 16
     pt, p32, p8 = [], [], []
     t = time.time()
-    for i in range(0, len(plain), B): pt += model.predict(plain[i:i + B], tok)
+    for i in range(0, len(plain), B): pt += mpredict(plain[i:i + B])
     log('torch predict %.1fs for %d sentences' % (time.time() - t, len(plain)))
     for i in range(0, len(plain), B): p32 += onnx_predict(s32, plain[i:i + B])
     t = time.time()
