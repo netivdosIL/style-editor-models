@@ -1,0 +1,23 @@
+function spellPlaceMenu(menu, x, y, er){
+  const GAP = 4, EDGE = 4;
+  const vh = window.innerHeight, vw = window.innerWidth;
+  const wr = spellWordRect(er, x, y);
+  menu.style.maxHeight = ''; menu.style.overflowY = '';
+  const h = menu.offsetHeight;
+  const below = vh - wr.bottom - GAP - EDGE;   // free room under the word
+  const above = wr.top - GAP - EDGE;           // free room over the word
+  let top;
+  if (h <= below) top = wr.bottom + GAP;                  // fits under — as before
+  else if (h <= above) top = wr.top - GAP - h;            // near the bottom: open above the word
+  else {                                                  // very low window: take the bigger side and scroll inside
+    const room = Math.max(below, above, 60);
+    menu.style.maxHeight = room + 'px';
+    menu.style.overflowY = 'auto';
+    const hh = menu.offsetHeight;
+    top = (below >= above) ? wr.bottom + GAP : wr.top - GAP - hh;
+  }
+  top = Math.max(EDGE, Math.min(top, vh - menu.offsetHeight - EDGE));
+  const w = menu.offsetWidth;
+  menu.style.left = Math.max(EDGE, Math.min(x - w, vw - w - EDGE)) + 'px';
+  menu.style.top = top + 'px';
+}
