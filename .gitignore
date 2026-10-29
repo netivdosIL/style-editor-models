@@ -1,0 +1,11 @@
+# never commit secrets or signing keys
+*.jwk
+*.pem
+*.key
+*.pfx
+*.env
+.env*
+*private*
+*פרטי*
+*secret*
+__pycache__/
