@@ -1,0 +1,28 @@
+# Publishes the Torah-sources install file as release "sources-v1". Runs once on push to this branch.
+name: Release sources-v1
+on:
+  push:
+    branches: [sources-v1-release]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: sources-v1
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          ls -la release-files
+          sha256sum release-files/netivdos-sources.ndpack
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target main --title "sources-v1 — מקורות תורניים" \
+              --notes "קובץ התקנה של המקורות התורניים (תנ\"ך, משנה, בבלי, שולחן ערוך) לעורך הסגנונות. מתקינים מחלון 📦 התקנת הרכיבים בעורך."
+          fi
+          for try in 1 2 3 4 5; do
+            gh release upload "$TAG" release-files/netivdos-sources.ndpack --clobber && break
+            sleep $((try * 10))
+          done
+          gh release view "$TAG"
